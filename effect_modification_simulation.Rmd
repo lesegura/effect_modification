@@ -1,0 +1,239 @@
+---
+title: "Effect Modification SCC Simulation"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(shiny)
+library(tidyverse)
+library(broom)
+library(sandwich)
+library(lmtest)
+library(here)
+
+# Combined helper to simulate both scenarios once, capturing CIs
+simulate_both <- function(n_sims, n,
+                          pr_A, pr_B, pr_C,
+                          pr_U1, pr_U2, pr_U3,
+                          session = NULL) {
+  
+  set.seed(7856)
+  
+  if (!is.null(session)) {
+    progress <- shiny::Progress$new(session, min = 0, max = n_sims)
+    on.exit(progress$close())
+  } else {
+    progress <- NULL
+  }
+
+  rd1_list <- vector("list", n_sims)
+  rr1_list <- vector("list", n_sims)
+  rd2_list <- vector("list", n_sims)
+  rr2_list <- vector("list", n_sims)
+
+  for (i in seq_len(n_sims)) {
+    if (!is.null(progress)) progress$set(message = sprintf("Iteration %d of %d", i, n_sims), value = i)
+
+    dat <- tibble(
+      A  = rbinom(n, 1, pr_A),
+      B  = rbinom(n, 1, pr_B),
+      U1 = rbinom(n, 1, pr_U1),
+      U2 = rbinom(n, 1, pr_U2),
+      C  = rbinom(n, 1, pr_C)
+    )
+    # Scenario 1
+    dat1 <- dat %>% mutate(Y = as.integer((A & U1) | (A & B & U2) | C))
+    # Scenario 2
+    dat2 <- dat %>%
+      mutate(U3 = rbinom(n, 1, pr_U3)) %>%
+      mutate(Y = as.integer((A & U1) | (A & B & U2) | (B & U3) | C))
+
+    # Scenario 1 RD & CI
+    rd1_list[[i]] <- bind_rows(
+      glm(Y ~ A, data = filter(dat1, B == 0), family = binomial(link = "identity")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=0",
+                  RD = estimate,
+                  conf.low = conf.low,
+                  conf.high = conf.high),
+      glm(Y ~ A, data = filter(dat1, B == 1), family = binomial(link = "identity")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=1",
+                  RD = estimate,
+                  conf.low = conf.low,
+                  conf.high = conf.high)
+    )
+
+    # Scenario 1 RR & CI
+    rr1_list[[i]] <- bind_rows(
+      glm(Y ~ A, data = filter(dat1, B == 0), family = binomial(link = "log")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=0",
+                  RR = exp(estimate),
+                  conf.low = exp(conf.low),
+                  conf.high = exp(conf.high)),
+      glm(Y ~ A, data = filter(dat1, B == 1), family = binomial(link = "log")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=1",
+                  RR = exp(estimate),
+                  conf.low = exp(conf.low),
+                  conf.high = exp(conf.high))
+    )
+
+    # Scenario 2 RD & CI
+    rd2_list[[i]] <- bind_rows(
+      glm(Y ~ A, data = filter(dat2, B == 0), family = binomial(link = "identity")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=0",
+                  RD = estimate,
+                  conf.low = conf.low,
+                  conf.high = conf.high),
+      glm(Y ~ A, data = filter(dat2, B == 1), family = binomial(link = "identity")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=1",
+                  RD = estimate,
+                  conf.low = conf.low,
+                  conf.high = conf.high)
+    )
+
+    # Scenario 2 RR & CI
+    rr2_list[[i]] <- bind_rows(
+      glm(Y ~ A, data = filter(dat2, B == 0), family = binomial(link = "log")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=0",
+                  RR = exp(estimate),
+                  conf.low = exp(conf.low),
+                  conf.high = exp(conf.high)),
+      glm(Y ~ A, data = filter(dat2, B == 1), family = binomial(link = "log")) %>%
+        coeftest(vcov = vcovHC, type = "HC3") %>%
+        tidy(conf.int = TRUE) %>%
+        filter(term == "A") %>%
+        transmute(sim = i, strata = "B=1",
+                  RR = exp(estimate),
+                  conf.low = exp(conf.low),
+                  conf.high = exp(conf.high))
+    )
+  }
+
+  rd1 <- bind_rows(rd1_list) %>% group_by(strata) %>%
+    summarise(
+      RD       = mean(RD),
+      conf.low = mean(conf.low),
+      conf.high= mean(conf.high),
+      .groups  = "drop"
+    )
+  rr1 <- bind_rows(rr1_list) %>% group_by(strata) %>%
+    summarise(
+      RR       = mean(RR),
+      conf.low = mean(conf.low),
+      conf.high= mean(conf.high),
+      .groups  = "drop"
+    )
+  rd2 <- bind_rows(rd2_list) %>% group_by(strata) %>%
+    summarise(
+      RD       = mean(RD),
+      conf.low = mean(conf.low),
+      conf.high= mean(conf.high),
+      .groups  = "drop"
+    )
+  rr2 <- bind_rows(rr2_list) %>% group_by(strata) %>%
+    summarise(
+      RR       = mean(RR),
+      conf.low = mean(conf.low),
+      conf.high= mean(conf.high),
+      .groups  = "drop"
+    )
+
+  list(rd1 = rd1, rr1 = rr1, rd2 = rd2, rr2 = rr2)
+}
+
+# Reactive that runs simulation once per click
+allSim <- eventReactive(input$run, {
+  simulate_both(
+    n_sims = input$n_sims,
+    n       = input$n,
+    pr_A    = input$pr_A,
+    pr_B    = input$pr_B,
+    pr_C    = input$pr_C,
+    pr_U1   = input$pr_U1,
+    pr_U2   = input$pr_U2,
+    pr_U3   = input$pr_U3,
+    session = shiny::getDefaultReactiveDomain()
+  )
+})
+```
+
+Row {data-height=300}
+-----------------------------------------------------------------------
+### Component‐Cause Pies
+```{r pies, echo=FALSE}
+knitr::include_graphics(here("pies.jpg"))
+```
+
+Sidebar {.sidebar}
+-----------------------------------------------------------------------
+```{r inputs, echo=FALSE}
+numericInput("n_sims", "Number of simulations:", 100, min = 1)
+numericInput("n", "Sample size (n):", 10000, min = 1)
+sliderInput("pr_A",  "Pr(A):",  0, 1, 0.4, step = 0.01)
+sliderInput("pr_B",  "Pr(B):",  0, 1, 0.2, step = 0.01)
+sliderInput("pr_C",  "Pr(C):",  0, 1, 0.1, step = 0.01)
+sliderInput("pr_U1", "Pr(U1):", 0, 1, 0.1, step = 0.01)
+sliderInput("pr_U2", "Pr(U2):", 0, 1, 0.1, step = 0.01)
+sliderInput("pr_U3", "Pr(U3):", 0, 1, 0.1, step = 0.01)
+actionButton("run", "Run simulation")
+```
+
+Column {data-width=650}
+-----------------------------------------------------------------------
+### Scenario 1: Risk Differences
+```{r rd1, echo=FALSE}
+renderTable({
+  req(allSim())
+  allSim()$rd1
+})
+```
+
+### Scenario 1: Risk Ratios
+```{r rr1, echo=FALSE}
+renderTable({
+  req(allSim())
+  allSim()$rr1
+})
+```
+
+Column {data-width=650}
+-----------------------------------------------------------------------
+### Scenario 2: Risk Differences
+```{r rd2, echo=FALSE}
+renderTable({
+  req(allSim())
+  allSim()$rd2
+})
+```
+
+### Scenario 2: Risk Ratios
+```{r rr2, echo=FALSE}
+renderTable({
+  req(allSim())
+  allSim()$rr2
+})
+```
